@@ -128,41 +128,66 @@ function sfxLevelUp() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() =>
 const keys = {};
 let touchX = -1, touchY = -1, touchActive = false, touchFire = false;
 let touchStartTime = 0;
+let touchAbsorb = false, absorbTouchId = -1, moveTouchId = -1;
 
-document.addEventListener('keydown', e => { keys[e.code] = true; if (['Space','ArrowLeft','ArrowRight','ArrowUp','ArrowDown'].includes(e.code)) e.preventDefault(); });
+document.addEventListener('keydown', e => { keys[e.code] = true; if (['Space','ArrowLeft','ArrowRight','ArrowUp','ArrowDown','ShiftLeft','ShiftRight'].includes(e.code)) e.preventDefault(); });
 document.addEventListener('keyup', e => { keys[e.code] = false; });
+
+function getTouchCoords(t) {
+  const r = canvas.getBoundingClientRect();
+  return { x: (t.clientX - r.left) / r.width * W, y: (t.clientY - r.top) / r.height * H };
+}
+
+function isAbsorbZone(x, y) { return x > W - 70 && y > H - 70; }
 
 canvas.addEventListener('touchstart', e => {
   e.preventDefault(); initAudio();
-  const t = e.touches[0];
-  const r = canvas.getBoundingClientRect();
-  touchX = (t.clientX - r.left) / r.width * W;
-  touchY = (t.clientY - r.top) / r.height * H;
-  touchActive = true; touchFire = true; touchStartTime = performance.now();
   if (gameState === STATE.TITLE) { startGame(); return; }
-  if (gameState === STATE.GAME_OVER && stateTimer > 3.5) { saveHiScore(score); gameState = STATE.TITLE; }
+  if (gameState === STATE.GAME_OVER && stateTimer > 3.5) { saveHiScore(score); gameState = STATE.TITLE; return; }
+  for (let i = 0; i < e.changedTouches.length; i++) {
+    const t = e.changedTouches[i];
+    const c = getTouchCoords(t);
+    if (isAbsorbZone(c.x, c.y) && absorbTouchId === -1) {
+      absorbTouchId = t.identifier;
+      touchAbsorb = true;
+    } else if (moveTouchId === -1) {
+      moveTouchId = t.identifier;
+      touchX = c.x; touchY = c.y;
+      touchActive = true; touchFire = true; touchStartTime = performance.now();
+    }
+  }
 }, { passive: false });
 
 canvas.addEventListener('touchmove', e => {
   e.preventDefault();
-  const t = e.touches[0];
-  const r = canvas.getBoundingClientRect();
-  touchX = (t.clientX - r.left) / r.width * W;
-  touchY = (t.clientY - r.top) / r.height * H;
+  for (let i = 0; i < e.changedTouches.length; i++) {
+    const t = e.changedTouches[i];
+    const c = getTouchCoords(t);
+    if (t.identifier === moveTouchId) { touchX = c.x; touchY = c.y; }
+  }
 }, { passive: false });
 
-canvas.addEventListener('touchend', e => { e.preventDefault(); touchActive = false; touchFire = false; }, { passive: false });
+canvas.addEventListener('touchend', e => {
+  e.preventDefault();
+  for (let i = 0; i < e.changedTouches.length; i++) {
+    const t = e.changedTouches[i];
+    if (t.identifier === absorbTouchId) { absorbTouchId = -1; touchAbsorb = false; }
+    if (t.identifier === moveTouchId) { moveTouchId = -1; touchActive = false; touchFire = false; }
+  }
+}, { passive: false });
 
 canvas.addEventListener('mousedown', e => {
   initAudio();
   const r = canvas.getBoundingClientRect();
   touchX = (e.clientX - r.left) / r.width * W;
+  touchY = (e.clientY - r.top) / r.height * H;
   touchActive = true; touchFire = true;
 });
 canvas.addEventListener('mousemove', e => {
   if (!touchActive) return;
   const r = canvas.getBoundingClientRect();
   touchX = (e.clientX - r.left) / r.width * W;
+  touchY = (e.clientY - r.top) / r.height * H;
 });
 canvas.addEventListener('mouseup', () => { touchActive = false; touchFire = false; });
 
@@ -182,6 +207,27 @@ let frameCount = 0;
 let corruptionLevel = 0;
 let eventActive = null, eventTimer = 0;
 let allyShip = null;
+
+// ═══════════════════════════════════════════════
+// VOID ABSORB STATE
+// ═══════════════════════════════════════════════
+const VOID_ABSORB_RADIUS = 60;
+const VOID_ABSORB_PULL_RADIUS = 90;
+const VOID_ENERGY_PER_BULLET = 0.08;
+const VOID_OVERLOAD_THRESHOLD = 5;
+const VOID_OVERLOAD_WINDOW = 0.5;
+const VOID_MIN_CHARGE = 0.25;
+
+let voidEnergy = 0, voidAbsorbing = false, voidOverloaded = false, voidOverloadTimer = 0;
+let voidBlastActive = false, voidBlastX = 0, voidBlastY = 0, voidBlastRadius = 0, voidBlastMaxRadius = 0, voidBlastDamage = 0;
+let voidAbsorbBullets = [], voidFieldPulse = 0, prevAbsorbing = false;
+
+// ═══════════════════════════════════════════════
+// DANGER ZONE STATE
+// ═══════════════════════════════════════════════
+const ZONE_SAFE_Y = H * 2 / 3;
+const ZONE_MID_Y = H * 1 / 3;
+let dangerTintAlpha = 0;
 
 // ═══════════════════════════════════════════════
 // OBJECT POOLS
@@ -256,6 +302,8 @@ function resetPlayer() {
   player.weapon = 0; player.weaponTimer = 0; player.weaponDuration = 0;
   player.fireTimer = 0; player.invincible = 2; player.alive = true;
   player.deathTimer = 0; player.beamActive = false;
+  voidEnergy = 0; voidAbsorbing = false; voidOverloaded = false; voidOverloadTimer = 0;
+  voidBlastActive = false; voidAbsorbBullets = []; voidFieldPulse = 0; prevAbsorbing = false;
 }
 
 function updatePlayer(dt) {
@@ -268,18 +316,58 @@ function updatePlayer(dt) {
     return;
   }
 
-  let dx = 0;
-  if (keys['ArrowLeft'] || keys['KeyA']) dx = -1;
-  if (keys['ArrowRight'] || keys['KeyD']) dx = 1;
-
-  if (touchActive) {
-    const diff = touchX - player.x;
-    if (Math.abs(diff) > 5) dx = diff > 0 ? 1 : -1;
-    if (Math.abs(diff) < 20) dx *= Math.abs(diff) / 20;
+  // Void overload cooldown
+  if (voidOverloaded) {
+    voidOverloadTimer -= dt;
+    if (voidOverloadTimer <= 0) voidOverloaded = false;
   }
 
-  player.x += dx * player.speed * dt;
+  // Absorb state from input
+  const shiftHeld = keys['ShiftLeft'] || keys['ShiftRight'] || touchAbsorb;
+  voidAbsorbing = shiftHeld && !voidOverloaded && player.alive;
+
+  // Detect shift release for auto-blast
+  if (prevAbsorbing && !voidAbsorbing && !voidOverloaded && voidEnergy >= VOID_MIN_CHARGE) {
+    fireVoidBlast();
+  }
+  prevAbsorbing = voidAbsorbing;
+
+  // Manual blast with X key
+  if ((keys['KeyX']) && voidEnergy >= VOID_MIN_CHARGE && !voidAbsorbing && !voidOverloaded && !voidBlastActive) {
+    fireVoidBlast();
+    keys['KeyX'] = false;
+  }
+
+  // Speed penalty while absorbing
+  const speedMult = voidAbsorbing ? 0.5 : 1;
+
+  let dx = 0, dy = 0;
+  if (keys['ArrowLeft'] || keys['KeyA']) dx = -1;
+  if (keys['ArrowRight'] || keys['KeyD']) dx = 1;
+  if (keys['ArrowUp'] || keys['KeyW']) dy = -1;
+  if (keys['ArrowDown'] || keys['KeyS']) dy = 1;
+
+  // Normalize diagonal
+  if (dx !== 0 && dy !== 0) {
+    const norm = 1 / Math.sqrt(2);
+    dx *= norm; dy *= norm;
+  }
+
+  if (touchActive) {
+    const diffX = touchX - player.x;
+    const diffY = touchY - player.y;
+    const touchDist = Math.sqrt(diffX * diffX + diffY * diffY);
+    if (touchDist > 5) {
+      dx = diffX / touchDist;
+      dy = diffY / touchDist;
+      if (touchDist < 20) { dx *= touchDist / 20; dy *= touchDist / 20; }
+    }
+  }
+
+  player.x += dx * player.speed * speedMult * dt;
+  player.y += dy * player.speed * speedMult * dt;
   player.x = clamp(player.x, 14, W - 14);
+  player.y = clamp(player.y, 40, H - 40);
 
   if (player.invincible > 0) player.invincible -= dt;
 
@@ -292,13 +380,22 @@ function updatePlayer(dt) {
   player.thrustPhase += dt * 15;
   player.beamActive = false;
 
-  const firing = keys['Space'] || keys['KeyZ'] || touchFire;
+  // Block firing while absorbing
+  const firing = (keys['Space'] || keys['KeyZ'] || touchFire) && !voidAbsorbing;
   if (firing && player.fireTimer <= 0) {
     firePlayerWeapon();
   }
   if (player.weapon === 4 && firing) {
     player.beamActive = true;
   }
+
+  // Update void systems
+  updateVoidAbsorbField(dt);
+  updateVoidBlast(dt);
+
+  // Danger zone tint
+  const targetTint = player.y < ZONE_MID_Y ? 0.15 : player.y < ZONE_SAFE_Y ? 0.05 : 0;
+  dangerTintAlpha = lerp(dangerTintAlpha, targetTint, dt * 3);
 }
 
 function firePlayerWeapon() {
@@ -385,6 +482,9 @@ function drawPlayer() {
 
   ctx.shadowBlur = 0;
   ctx.restore();
+
+  // Void absorb field
+  if (voidAbsorbing) drawVoidAbsorbField();
 
   // Beam weapon
   if (player.beamActive && player.weapon === 4) {
@@ -714,12 +814,14 @@ function updateBoss(dt) {
   if (boss.hp <= 0) {
     boss.alive = false;
     bossActive = false;
-    score += 5000 * (boss.type + 1);
+    const bossZoneMult = getZoneMultiplier(player.y);
+    const bossPts = 5000 * (boss.type + 1) * bossZoneMult;
+    score += bossPts;
     for (let i = 0; i < 80; i++) spawnExplosion(boss.x + rng(0, boss.w), boss.y + rng(0, boss.h), boss.color);
     sfxExplosion(true);
     triggerShake(20);
     slowMo = 1.5;
-    addFloatText(boss.x + boss.w / 2, boss.y, '+' + (5000 * (boss.type + 1)), '#ff0', 2);
+    addFloatText(boss.x + boss.w / 2, boss.y, '+' + bossPts, '#ff0', 2);
     boss = null;
     setTimeout(() => nextLevel(), 2000);
   }
@@ -998,6 +1100,374 @@ function drawFloatTexts() {
 }
 
 // ═══════════════════════════════════════════════
+// DANGER ZONES
+// ═══════════════════════════════════════════════
+function getZoneMultiplier(y) {
+  if (y < ZONE_MID_Y) return 3;
+  if (y < ZONE_SAFE_Y) return 2;
+  return 1;
+}
+
+function drawDangerZones() {
+  // Zone divider lines (dashed)
+  ctx.save();
+  ctx.setLineDash([8, 6]);
+  ctx.lineWidth = 1;
+
+  // Safe/Mid boundary
+  ctx.strokeStyle = 'rgba(255,255,100,0.25)';
+  ctx.beginPath(); ctx.moveTo(0, ZONE_SAFE_Y); ctx.lineTo(W, ZONE_SAFE_Y); ctx.stroke();
+
+  // Mid/Danger boundary
+  ctx.strokeStyle = 'rgba(255,80,80,0.3)';
+  ctx.beginPath(); ctx.moveTo(0, ZONE_MID_Y); ctx.lineTo(W, ZONE_MID_Y); ctx.stroke();
+
+  ctx.setLineDash([]);
+
+  // Zone labels on right edge
+  ctx.font = 'bold 10px monospace';
+  ctx.textAlign = 'right';
+  ctx.fillStyle = 'rgba(255,80,80,0.4)';
+  ctx.fillText('3x', W - 6, ZONE_MID_Y - 8);
+  ctx.fillStyle = 'rgba(255,255,100,0.35)';
+  ctx.fillText('2x', W - 6, ZONE_SAFE_Y - 8);
+  ctx.fillStyle = 'rgba(150,150,150,0.25)';
+  ctx.fillText('1x', W - 6, H - 50);
+
+  // Red vignette from top when in danger zone
+  if (dangerTintAlpha > 0.005) {
+    const grad = ctx.createLinearGradient(0, 0, 0, H * 0.5);
+    grad.addColorStop(0, `rgba(255,0,0,${dangerTintAlpha})`);
+    grad.addColorStop(1, 'rgba(255,0,0,0)');
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, W, H * 0.5);
+  }
+
+  ctx.restore();
+}
+
+function drawZoneMultiplierNearPlayer() {
+  const mult = getZoneMultiplier(player.y);
+  if (mult <= 1 || !player.alive) return;
+  ctx.save();
+  ctx.font = 'bold 12px monospace';
+  ctx.textAlign = 'center';
+  const col = mult === 3 ? 'rgba(255,80,80,0.7)' : 'rgba(255,255,100,0.6)';
+  ctx.fillStyle = col;
+  ctx.shadowColor = col; ctx.shadowBlur = 6;
+  ctx.fillText(mult + 'x', player.x, player.y + 28);
+  ctx.shadowBlur = 0;
+  ctx.restore();
+}
+
+// ═══════════════════════════════════════════════
+// VOID ABSORB SYSTEM
+// ═══════════════════════════════════════════════
+function absorbBullet(b) {
+  b.active = false;
+  voidEnergy = Math.min(1, voidEnergy + VOID_ENERGY_PER_BULLET);
+
+  // Track for overload detection
+  const now = performance.now() / 1000;
+  voidAbsorbBullets.push(now);
+  // Remove old timestamps
+  voidAbsorbBullets = voidAbsorbBullets.filter(t => now - t < VOID_OVERLOAD_WINDOW);
+
+  // Check overload
+  if (voidAbsorbBullets.length >= VOID_OVERLOAD_THRESHOLD) {
+    triggerVoidOverload();
+  }
+
+  // Purple absorb particles
+  for (let i = 0; i < 4; i++) {
+    const p = particles.get();
+    if (!p) break;
+    const a = rng(0, TAU), spd = rng(20, 60);
+    p.x = b.x; p.y = b.y;
+    p.vx = Math.cos(a) * spd; p.vy = Math.sin(a) * spd;
+    p.life = p.maxLife = rng(0.15, 0.3); p.r = rng(2, 4);
+    p.color = '#c0f'; p.type = 0;
+  }
+
+  sfxAbsorb();
+}
+
+function triggerVoidOverload() {
+  voidOverloaded = true;
+  voidOverloadTimer = 1.5;
+  voidAbsorbing = false;
+  voidEnergy = Math.max(0, voidEnergy - 0.3);
+  voidAbsorbBullets = [];
+
+  // Explosion effect
+  spawnExplosion(player.x, player.y, '#f0f', 20);
+  triggerShake(6);
+  player.invincible = Math.max(player.invincible, 0.5);
+
+  sfxOverload();
+}
+
+function updateVoidAbsorbField(dt) {
+  if (!voidAbsorbing) return;
+  voidFieldPulse += dt * 6;
+
+  // Spawn spiral inward particles
+  if (frameCount % 3 === 0) {
+    const a = voidFieldPulse * 2 + rng(0, TAU);
+    const r = VOID_ABSORB_PULL_RADIUS * rng(0.5, 1);
+    const p = particles.get();
+    if (p) {
+      p.x = player.x + Math.cos(a) * r;
+      p.y = player.y + Math.sin(a) * r;
+      const inA = Math.atan2(player.y - p.y, player.x - p.x);
+      p.vx = Math.cos(inA) * 60; p.vy = Math.sin(inA) * 60;
+      p.life = p.maxLife = 0.4; p.r = 2;
+      p.color = hsl(280, 80, 60, 0.8); p.type = 0;
+    }
+  }
+}
+
+function fireVoidBlast() {
+  if (voidBlastActive) return;
+  const charge = voidEnergy;
+  voidBlastActive = true;
+  voidBlastX = player.x;
+  voidBlastY = player.y;
+  voidBlastRadius = 0;
+  voidBlastMaxRadius = lerp(80, 250, charge);
+  voidBlastDamage = lerp(2, 10, charge);
+  voidEnergy = 0;
+  voidAbsorbBullets = [];
+
+  triggerShake(5 + charge * 10);
+  slowMo = Math.max(slowMo, 0.3 + charge * 0.5);
+  sfxVoidBlast();
+}
+
+function updateVoidBlast(dt) {
+  if (!voidBlastActive) return;
+  voidBlastRadius += 400 * dt;
+
+  // Damage enemies in ring (band of 30px)
+  const innerR = Math.max(0, voidBlastRadius - 30);
+  const outerR = voidBlastRadius;
+  const zoneMult = getZoneMultiplier(player.y);
+
+  for (let i = 0; i < enemies.length; i++) {
+    const e = enemies[i];
+    if (!e.alive) continue;
+    const d = dist(voidBlastX, voidBlastY, e.x + e.w / 2, e.y + e.h / 2);
+    if (d >= innerR && d <= outerR) {
+      e.hp -= voidBlastDamage;
+      if (e.hp <= 0) {
+        e.alive = false; totalKills++;
+        const pts = e.score * comboMultiplier * zoneMult;
+        score += pts;
+        combo++; comboTimer = 2;
+        comboMultiplier = Math.min(10, 1 + Math.floor(combo / 5));
+        spawnExplosion(e.x + e.w / 2, e.y + e.h / 2, '#c0f', 15);
+        sfxExplosion(false);
+        addFloatText(e.x + e.w / 2, e.y, '+' + pts, '#c0f');
+        spawnPowerUp(e.x + e.w / 2, e.y + e.h / 2);
+      }
+    }
+  }
+
+  // Damage boss
+  if (boss && boss.alive && !boss.entering) {
+    const bcx = boss.x + boss.w / 2, bcy = boss.y + boss.h / 2;
+    const d = dist(voidBlastX, voidBlastY, bcx, bcy);
+    if (d >= innerR && d <= outerR + boss.size) {
+      boss.hp -= voidBlastDamage * 0.5 * dt * 60;
+      if (frameCount % 4 === 0) spawnExplosion(bcx + rng(-20, 20), bcy + rng(-20, 20), '#c0f', 3);
+    }
+    for (let i = 0; i < boss.segments.length; i++) {
+      const seg = boss.segments[i];
+      if (!seg.alive) continue;
+      const sx = bcx + Math.cos(seg.angle) * seg.dist;
+      const sy = bcy + Math.sin(seg.angle) * seg.dist;
+      const sd = dist(voidBlastX, voidBlastY, sx, sy);
+      if (sd >= innerR && sd <= outerR) {
+        seg.hp -= voidBlastDamage * 0.3;
+        if (seg.hp <= 0) {
+          seg.alive = false;
+          spawnExplosion(sx, sy, '#c0f', 15);
+          sfxExplosion(false);
+          const pts = 500 * zoneMult;
+          score += pts;
+          addFloatText(sx, sy, '+' + pts, '#c0f');
+        }
+      }
+    }
+  }
+
+  // Destroy enemy bullets in blast
+  eBullets.each(b => {
+    const d = dist(voidBlastX, voidBlastY, b.x, b.y);
+    if (d <= outerR) {
+      b.active = false;
+      const p = particles.get();
+      if (p) { p.x = b.x; p.y = b.y; p.vx = rng(-30, 30); p.vy = rng(-30, 30); p.life = p.maxLife = 0.2; p.r = 3; p.color = '#c0f'; p.type = 0; }
+    }
+  });
+
+  if (voidBlastRadius >= voidBlastMaxRadius) {
+    voidBlastActive = false;
+  }
+}
+
+function drawVoidAbsorbField() {
+  const x = player.x, y = player.y;
+  ctx.save();
+
+  // Outer pull radius gradient
+  const outerGrad = ctx.createRadialGradient(x, y, VOID_ABSORB_RADIUS, x, y, VOID_ABSORB_PULL_RADIUS);
+  outerGrad.addColorStop(0, 'rgba(160,0,255,0.08)');
+  outerGrad.addColorStop(1, 'rgba(160,0,255,0)');
+  ctx.fillStyle = outerGrad;
+  ctx.beginPath(); ctx.arc(x, y, VOID_ABSORB_PULL_RADIUS, 0, TAU); ctx.fill();
+
+  // Inner absorb radius gradient
+  const innerGrad = ctx.createRadialGradient(x, y, 0, x, y, VOID_ABSORB_RADIUS);
+  innerGrad.addColorStop(0, `rgba(180,0,255,${0.1 + voidEnergy * 0.15})`);
+  innerGrad.addColorStop(0.7, `rgba(140,0,220,${0.06 + voidEnergy * 0.1})`);
+  innerGrad.addColorStop(1, 'rgba(120,0,200,0)');
+  ctx.fillStyle = innerGrad;
+  ctx.beginPath(); ctx.arc(x, y, VOID_ABSORB_RADIUS, 0, TAU); ctx.fill();
+
+  // 4 rotating ring segments
+  ctx.strokeStyle = hsl(280, 90, 60, 0.5 + 0.3 * Math.sin(voidFieldPulse));
+  ctx.lineWidth = 2;
+  for (let i = 0; i < 4; i++) {
+    const startA = voidFieldPulse + i * PI / 2;
+    ctx.beginPath();
+    ctx.arc(x, y, VOID_ABSORB_RADIUS - 2, startA, startA + PI / 4);
+    ctx.stroke();
+  }
+
+  // Energy glow on ship
+  if (voidEnergy > 0) {
+    const glowGrad = ctx.createRadialGradient(x, y, 0, x, y, 20);
+    glowGrad.addColorStop(0, `rgba(200,0,255,${voidEnergy * 0.4})`);
+    glowGrad.addColorStop(1, 'rgba(200,0,255,0)');
+    ctx.fillStyle = glowGrad;
+    ctx.beginPath(); ctx.arc(x, y, 20, 0, TAU); ctx.fill();
+  }
+
+  ctx.restore();
+}
+
+function drawVoidBlast() {
+  if (!voidBlastActive) return;
+  const progress = voidBlastRadius / voidBlastMaxRadius;
+  const alpha = 1 - progress;
+  ctx.save();
+
+  // Inner gradient fill
+  const grad = ctx.createRadialGradient(voidBlastX, voidBlastY, voidBlastRadius * 0.7, voidBlastX, voidBlastY, voidBlastRadius);
+  grad.addColorStop(0, `rgba(200,0,255,${alpha * 0.1})`);
+  grad.addColorStop(1, `rgba(160,0,220,${alpha * 0.2})`);
+  ctx.fillStyle = grad;
+  ctx.beginPath(); ctx.arc(voidBlastX, voidBlastY, voidBlastRadius, 0, TAU); ctx.fill();
+
+  // Ring stroke
+  ctx.strokeStyle = hsl(280, 100, 70, alpha * 0.8);
+  ctx.lineWidth = 4 + (1 - progress) * 6;
+  ctx.shadowColor = '#c0f'; ctx.shadowBlur = 15;
+  ctx.beginPath(); ctx.arc(voidBlastX, voidBlastY, voidBlastRadius, 0, TAU); ctx.stroke();
+
+  ctx.shadowBlur = 0;
+  ctx.restore();
+}
+
+function drawVoidEnergyBar() {
+  const barW = 120, barH = 8;
+  const barX = W - barW - 10, barY = H - 20;
+
+  ctx.save();
+  // Background
+  ctx.fillStyle = 'rgba(40,0,60,0.6)';
+  ctx.fillRect(barX, barY, barW, barH);
+
+  // Fill
+  const fillCol = voidOverloaded ? '#f00' : '#c0f';
+  ctx.fillStyle = fillCol;
+  ctx.fillRect(barX, barY, barW * voidEnergy, barH);
+
+  // 25% marker
+  ctx.strokeStyle = 'rgba(255,255,255,0.4)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(barX + barW * VOID_MIN_CHARGE, barY);
+  ctx.lineTo(barX + barW * VOID_MIN_CHARGE, barY + barH);
+  ctx.stroke();
+
+  // Border (glows when above min charge)
+  if (voidEnergy >= VOID_MIN_CHARGE && !voidOverloaded) {
+    ctx.shadowColor = '#c0f'; ctx.shadowBlur = 6;
+  }
+  ctx.strokeStyle = voidEnergy >= VOID_MIN_CHARGE ? '#e0a0ff' : '#666';
+  ctx.strokeRect(barX, barY, barW, barH);
+  ctx.shadowBlur = 0;
+
+  // Label
+  ctx.font = '8px monospace'; ctx.textAlign = 'right';
+  if (voidOverloaded) {
+    ctx.fillStyle = Math.floor(frameCount * 0.15) % 2 ? '#f00' : '#800';
+    ctx.fillText('OVERLOAD', barX - 4, barY + 7);
+  } else {
+    ctx.fillStyle = '#a060c0';
+    ctx.fillText('VOID', barX - 4, barY + 7);
+  }
+
+  ctx.restore();
+}
+
+function drawAbsorbButton() {
+  // Touch absorb button in bottom-right
+  const bx = W - 40, by = H - 40, r = 25;
+  ctx.save();
+  const active = touchAbsorb;
+  ctx.strokeStyle = active ? '#e0a0ff' : '#806090';
+  ctx.lineWidth = 2;
+  if (active) { ctx.shadowColor = '#c0f'; ctx.shadowBlur = 10; }
+  ctx.fillStyle = active ? 'rgba(160,0,255,0.3)' : 'rgba(80,0,120,0.2)';
+
+  // Hexagon
+  ctx.beginPath();
+  for (let i = 0; i < 6; i++) {
+    const a = i * TAU / 6 - PI / 2;
+    ctx.lineTo(bx + Math.cos(a) * r, by + Math.sin(a) * r);
+  }
+  ctx.closePath(); ctx.fill(); ctx.stroke();
+
+  ctx.fillStyle = active ? '#fff' : '#a070c0';
+  ctx.font = 'bold 14px monospace'; ctx.textAlign = 'center';
+  ctx.fillText('V', bx, by + 5);
+  ctx.shadowBlur = 0;
+  ctx.restore();
+}
+
+// Void SFX
+function sfxAbsorb() {
+  const pitch = 300 + voidEnergy * 500;
+  playTone(pitch, 0.08, 'sine', 0.06);
+}
+
+function sfxVoidBlast() {
+  playNoise(0.3, 0.18);
+  playTone(400, 0.2, 'sine', 0.12);
+  playTone(200, 0.4, 'sine', 0.1);
+  playTone(100, 0.5, 'sine', 0.08);
+}
+
+function sfxOverload() {
+  playTone(100, 0.3, 'sawtooth', 0.15);
+  playNoise(0.2, 0.15);
+  playTone(80, 0.4, 'sawtooth', 0.1);
+}
+
+// ═══════════════════════════════════════════════
 // COLLISION DETECTION
 // ═══════════════════════════════════════════════
 function checkCollisions() {
@@ -1021,14 +1491,17 @@ function checkCollisions() {
 
         if (e.hp <= 0) {
           e.alive = false; totalKills++;
-          score += e.score * comboMultiplier;
+          const zoneMult = getZoneMultiplier(player.y);
+          const pts = e.score * comboMultiplier * zoneMult;
+          score += pts;
           combo++; comboTimer = 2;
           comboMultiplier = Math.min(10, 1 + Math.floor(combo / 5));
           if (combo > 0 && combo % 5 === 0) sfxCombo(comboMultiplier);
           spawnExplosion(e.x + e.w / 2, e.y + e.h / 2, ENEMY_TYPES[e.type].color, 15);
           sfxExplosion(false);
-          addFloatText(e.x + e.w / 2, e.y, '+' + (e.score * comboMultiplier), ENEMY_TYPES[e.type].color);
+          addFloatText(e.x + e.w / 2, e.y, '+' + pts, ENEMY_TYPES[e.type].color);
           if (comboMultiplier > 1) addFloatText(e.x + e.w / 2, e.y - 12, 'x' + comboMultiplier, '#ff0', 0.8);
+          if (zoneMult > 1) addFloatText(e.x + e.w / 2, e.y - 24, 'ZONE ' + zoneMult + 'x', '#f80', 0.7);
           spawnPowerUp(e.x + e.w / 2, e.y + e.h / 2);
           triggerShake(3);
         }
@@ -1054,8 +1527,10 @@ function checkCollisions() {
             seg.alive = false;
             spawnExplosion(sx, sy, boss.color, 20);
             sfxExplosion(false);
-            score += 500;
-            addFloatText(sx, sy, '+500', '#ff0');
+            const segZoneMult = getZoneMultiplier(player.y);
+            const segPts = 500 * segZoneMult;
+            score += segPts;
+            addFloatText(sx, sy, '+' + segPts, '#ff0');
           }
           b.active = false;
           break;
@@ -1093,12 +1568,14 @@ function checkCollisions() {
         if (frameCount % 4 === 0) spawnExplosion(e.x + e.w / 2, e.y + e.h / 2, '#f0f', 2);
         if (e.hp <= 0) {
           e.alive = false; totalKills++; totalHits++;
-          score += e.score * comboMultiplier;
+          const beamZoneMult = getZoneMultiplier(player.y);
+          const beamPts = e.score * comboMultiplier * beamZoneMult;
+          score += beamPts;
           combo++; comboTimer = 2;
           comboMultiplier = Math.min(10, 1 + Math.floor(combo / 5));
           spawnExplosion(e.x + e.w / 2, e.y + e.h / 2, ENEMY_TYPES[e.type].color, 15);
           sfxExplosion(false);
-          addFloatText(e.x + e.w / 2, e.y, '+' + (e.score * comboMultiplier), '#f0f');
+          addFloatText(e.x + e.w / 2, e.y, '+' + beamPts, '#f0f');
           spawnPowerUp(e.x + e.w / 2, e.y + e.h / 2);
         }
       }
@@ -1112,8 +1589,25 @@ function checkCollisions() {
     }
   }
 
-  // Enemy bullets vs player
+  // Enemy bullets vs player (with void absorb)
   eBullets.each(b => {
+    // Void absorb field check
+    if (voidAbsorbing && player.alive) {
+      const d = dist(b.x, b.y, player.x, player.y);
+      // Pull bullets toward player when in pull radius
+      if (d < VOID_ABSORB_PULL_RADIUS && d > VOID_ABSORB_RADIUS) {
+        const pullA = Math.atan2(player.y - b.y, player.x - b.x);
+        const pullStr = 200 * (1 - (d - VOID_ABSORB_RADIUS) / (VOID_ABSORB_PULL_RADIUS - VOID_ABSORB_RADIUS));
+        b.vx = lerp(b.vx, Math.cos(pullA) * pullStr, 0.1);
+        b.vy = lerp(b.vy, Math.sin(pullA) * pullStr, 0.1);
+      }
+      // Absorb bullets within absorb radius
+      if (d < VOID_ABSORB_RADIUS) {
+        absorbBullet(b);
+        return;
+      }
+    }
+
     // vs player
     if (player.invincible <= 0 && player.alive) {
       if (Math.abs(b.x - player.x) < 12 && Math.abs(b.y - player.y) < 14) {
@@ -1180,7 +1674,10 @@ function chainLightning(x, y, chains, dmg, skipIdx) {
     }
     if (e.hp <= 0) {
       e.alive = false; totalKills++;
-      score += e.score;
+      const chainZoneMult = getZoneMultiplier(player.y);
+      const chainPts = e.score * chainZoneMult;
+      score += chainPts;
+      addFloatText(e.x + e.w / 2, e.y, '+' + chainPts, '#0ff');
       spawnExplosion(e.x + e.w / 2, e.y + e.h / 2, '#0ff', 12);
     }
     if (chains > 1) chainLightning(e.x + e.w / 2, e.y + e.h / 2, chains - 1, dmg * 0.5, closest);
@@ -1195,6 +1692,7 @@ function playerHit() {
   player.alive = false;
   player.deathTimer = 1.5;
   player.weapon = 0; player.weaponDuration = 0;
+  voidEnergy = 0; voidAbsorbing = false; voidAbsorbBullets = [];
 }
 
 // ═══════════════════════════════════════════════
@@ -1406,6 +1904,8 @@ function startGame() {
   difficultyMod = 1; corruptionLevel = 0;
   bossActive = false; boss = null;
   eventActive = null; allyShip = null;
+  dangerTintAlpha = 0;
+  voidBlastActive = false;
   resetPlayer();
   clearBullets();
   particles.clear();
@@ -1452,6 +1952,17 @@ function drawHUD() {
     ctx.textAlign = 'left';
     ctx.fillText(WEAPON_NAMES[player.weapon] + ' ' + player.weaponDuration.toFixed(1) + 's', 10, H - 10);
   }
+
+  // Zone multiplier in HUD
+  const hudZone = getZoneMultiplier(player.y);
+  if (hudZone > 1) {
+    ctx.fillStyle = hudZone === 3 ? '#f55' : '#ff0';
+    ctx.font = 'bold 12px monospace';
+    ctx.textAlign = 'left';
+    ctx.shadowColor = ctx.fillStyle; ctx.shadowBlur = 4;
+    ctx.fillText('ZONE ' + hudZone + 'x', 10, H - 24);
+    ctx.shadowBlur = 0;
+  }
 }
 
 // ═══════════════════════════════════════════════
@@ -1488,9 +1999,10 @@ function drawTitle() {
 
   ctx.fillStyle = '#888';
   ctx.font = '10px monospace';
-  ctx.fillText('ARROWS / TOUCH: MOVE', W / 2, H * 0.68);
-  ctx.fillText('SPACE / TAP: FIRE', W / 2, H * 0.72);
-  ctx.fillText('C: CRT FILTER  P: PAUSE  M: MUTE', W / 2, H * 0.76);
+  ctx.fillText('WASD / ARROWS: MOVE (ALL DIRECTIONS)', W / 2, H * 0.65);
+  ctx.fillText('SPACE: FIRE   SHIFT: VOID ABSORB', W / 2, H * 0.69);
+  ctx.fillText('X: VOID BLAST   PUSH UP FOR HIGHER SCORE', W / 2, H * 0.73);
+  ctx.fillText('C: CRT   P: PAUSE   M: MUTE', W / 2, H * 0.77);
 
   // High scores
   if (hiScores.length > 0) {
@@ -1755,16 +2267,21 @@ function draw() {
   } else if (gameState === STATE.PLAYING || gameState === STATE.WAVE_INTRO || gameState === STATE.BOSS_WARNING || gameState === STATE.PAUSED) {
     drawStars();
     drawNebulae();
+    drawDangerZones();
     drawShields();
     drawEnemies();
     drawBoss();
     drawProjectiles();
     drawPowerUps();
     drawPlayer();
+    drawZoneMultiplierNearPlayer();
     drawParticles();
+    drawVoidBlast();
     drawFloatTexts();
     drawEvent();
     drawHUD();
+    drawVoidEnergyBar();
+    drawAbsorbButton();
 
     if (gameState === STATE.WAVE_INTRO) drawWaveIntro();
     if (gameState === STATE.BOSS_WARNING) drawBossWarning();
